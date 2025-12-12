@@ -1,0 +1,15 @@
+# Claude
+CLAUDE.md
+.claude/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Blender
+*.blend1
+*.blend2
