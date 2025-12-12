@@ -2,7 +2,7 @@
 
 A Blender addon that automatically rotates objects to minimize their axis-aligned bounding box volume. Useful for 3D printing, UV unwrapping, packing, and general scene optimization.
 
-![Blender](https://img.shields.io/badge/Blender-3.0%2B-orange)
+![Blender](https://img.shields.io/badge/Blender-4.2%2B-orange)
 
 ## Features
 
@@ -17,10 +17,32 @@ A Blender addon that automatically rotates objects to minimize their axis-aligne
 
 ## Installation
 
-1. Download `optimal_rotation.py`
-2. Open Blender and go to **Edit > Preferences > Add-ons**
-3. Click **Install...** and select the downloaded file
-4. Enable the addon by checking the box next to "Optimal Rotation (Smallest Bounding Box)"
+### Blender 4.2+ / 5.0 (Extension Format)
+
+1. Download or build the extension zip:
+   - **Option A**: Download `optimal_rotation_extension.zip` from releases
+   - **Option B**: Clone the repo and run `./build_extension.sh`
+2. Open Blender and go to **Edit > Preferences > Get Extensions**
+3. Click the dropdown arrow (top right) > **Install from Disk**
+4. Select `optimal_rotation_extension.zip`
+
+### Building from Source
+
+```bash
+git clone https://github.com/yourusername/blender-optimal-rotation-smallest-bounding-box.git
+cd blender-optimal-rotation-smallest-bounding-box
+./build_extension.sh
+```
+
+This creates `optimal_rotation_extension.zip` ready for installation.
+
+### File Structure
+
+```
+optimal_rotation.py      # Main addon code
+blender_manifest.toml    # Extension metadata
+build_extension.sh       # Build script
+```
 
 ## Usage
 
@@ -65,7 +87,7 @@ Use the **Show BBox** button to display the current bounding box wireframe in th
 
 ## Requirements
 
-- Blender 3.0 or newer
+- Blender 4.2 or newer
 - NumPy (included with Blender)
 
 ## License

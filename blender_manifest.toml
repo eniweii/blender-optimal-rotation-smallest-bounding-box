@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+schema_version = "1.0.0"
+
+id = "optimal_rotation"
+name = "Optimal Rotation (Smallest Bounding Box)"
+version = "1.1.0"
+tagline = "Rotates objects to minimize world-space bounding box"
+maintainer = "Noah Eisenbruch"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Import/export functionality"
