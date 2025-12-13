@@ -349,6 +349,12 @@ class OBJECT_OT_optimal_rotation(bpy.types.Operator):
                 best_area = area
                 refined_angle = test_angle
 
+        # Apply longest axis alignment if requested
+        if self.align_longest_to != 'NONE':
+            refined_angle = self._align_longest_axis_1d(
+                points, refined_angle, plane_indices, self.align_longest_to
+            )
+
         rotation_axis = 'X' if axis_idx == 0 else ('Y' if axis_idx == 1 else 'Z')
         rot_mat = mathutils.Matrix.Rotation(refined_angle, 4, rotation_axis)
 
@@ -368,6 +374,42 @@ class OBJECT_OT_optimal_rotation(bpy.types.Operator):
         max_pt = np.max(rotated, axis=0)
         dims = max_pt - min_pt
         return dims[0] * dims[1]
+
+    def _align_longest_axis_1d(self, points, angle, plane_indices, target_axis_str):
+        """Align longest axis when rotating around a single axis.
+
+        Can only swap between the two axes in the rotation plane.
+        If longest is along the rotation axis, it cannot be moved.
+        """
+        idx_u, idx_v = plane_indices
+
+        # Build 3D rotation matrix for current angle (rotation in the plane)
+        c, s = np.cos(angle), np.sin(angle)
+        rot_3d = np.eye(3)
+        rot_3d[idx_u, idx_u] = c
+        rot_3d[idx_u, idx_v] = -s
+        rot_3d[idx_v, idx_u] = s
+        rot_3d[idx_v, idx_v] = c
+
+        # Compute 3D bbox dimensions after rotation
+        rotated = points @ rot_3d.T
+        min_pt = np.min(rotated, axis=0)
+        max_pt = np.max(rotated, axis=0)
+        dims = max_pt - min_pt
+
+        longest_idx = np.argmax(dims)
+        target_idx = {'X': 0, 'Y': 1, 'Z': 2}[target_axis_str]
+
+        if longest_idx == target_idx:
+            return angle  # Already aligned
+
+        # Can only swap between axes in the rotation plane
+        if longest_idx in plane_indices and target_idx in plane_indices:
+            # Add 90° to swap the two plane axes
+            return angle + np.pi / 2
+
+        # Cannot satisfy: longest is on rotation axis or target is rotation axis
+        return angle
 
     def apply_optimal_rotation_2d(self, obj, points, locked_axis, pivot):
         """Optimize rotation in 2 axes with two-pass refinement."""
@@ -409,6 +451,12 @@ class OBJECT_OT_optimal_rotation(bpy.types.Operator):
             if area < best_area:
                 best_area = area
                 refined_angle = test_angle
+
+        # Apply longest axis alignment if requested
+        if self.align_longest_to != 'NONE':
+            refined_angle = self._align_longest_axis_1d(
+                points, refined_angle, active_indices, self.align_longest_to
+            )
 
         rotation_axis = 'X' if locked_axis == 0 else ('Y' if locked_axis == 1 else 'Z')
         rot_mat = mathutils.Matrix.Rotation(refined_angle, 4, rotation_axis)
@@ -682,16 +730,30 @@ def unregister():
 
     # Clean up draw handler
     if _bbox_draw_handler is not None:
-        bpy.types.SpaceView3D.draw_handler_remove(_bbox_draw_handler, 'WINDOW')
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(_bbox_draw_handler, 'WINDOW')
+        except Exception:
+            pass
         _bbox_draw_handler = None
     _bbox_data = None
 
-    del bpy.types.Scene.optimal_rotation_settings
-    bpy.utils.unregister_class(VIEW3D_PT_optimal_rotation)
-    bpy.utils.unregister_class(OptimalRotationSettings)
-    bpy.utils.unregister_class(OBJECT_OT_clear_bbox_preview)
-    bpy.utils.unregister_class(OBJECT_OT_preview_bbox)
-    bpy.utils.unregister_class(OBJECT_OT_optimal_rotation)
+    # Remove scene property
+    if hasattr(bpy.types.Scene, 'optimal_rotation_settings'):
+        del bpy.types.Scene.optimal_rotation_settings
+
+    # Unregister classes (continue even if one fails)
+    classes = [
+        VIEW3D_PT_optimal_rotation,
+        OptimalRotationSettings,
+        OBJECT_OT_clear_bbox_preview,
+        OBJECT_OT_preview_bbox,
+        OBJECT_OT_optimal_rotation,
+    ]
+    for cls in classes:
+        try:
+            bpy.utils.unregister_class(cls)
+        except RuntimeError:
+            pass
 
 
 if __name__ == "__main__":
