@@ -185,6 +185,40 @@ class OBJECT_OT_optimal_rotation(bpy.types.Operator):
 
         reduction = (1 - final_bbox / initial_bbox) * 100 if initial_bbox > 0 else 0
         return reduction
+        
+    def _apply_transform_and_keep_geometry(self, obj, new_mw):
+        """Applies the new world matrix while counter-transforming the mesh data to stay in place."""
+        old_mw = obj.matrix_world.copy()
+        
+        # Calculate matrix difference to perfectly counteract the object rotation
+        delta_mat = new_mw.inverted() @ old_mw
+
+        # Update the object's transform
+        obj.matrix_world = new_mw
+
+        # Counter-transform the underlying geometry data so it visually remains static in world space
+        if hasattr(obj.data, "transform"):
+            obj.data.transform(delta_mat)
+            if obj.type == 'MESH':
+                obj.data.update()
+                
+        # Force Blender to recalculate and redraw the object's bounding box
+        obj.update_tag()
+        bpy.context.view_layer.update()
+        """Applies the new world matrix while counter-transforming the mesh data to stay in place."""
+        old_mw = obj.matrix_world.copy()
+        
+        # Calculate matrix difference to perfectly counteract the object rotation
+        delta_mat = new_mw.inverted() @ old_mw
+
+        # Update the object's transform
+        obj.matrix_world = new_mw
+
+        # Counter-transform the underlying geometry data so it visually remains static in world space
+        if hasattr(obj.data, "transform"):
+            obj.data.transform(delta_mat)
+            if obj.type == 'MESH':
+                obj.data.update()
 
     def compute_bbox_volume(self, points):
         """Compute axis-aligned bounding box volume."""
@@ -247,15 +281,17 @@ class OBJECT_OT_optimal_rotation(bpy.types.Operator):
         if self.align_longest_to != 'NONE':
             best_rotation = self._align_longest_axis(points, best_rotation, self.align_longest_to)
 
-        rotation_matrix = mathutils.Matrix(best_rotation.tolist()).to_3x3()
-        rot_mat_4x4 = rotation_matrix.to_4x4()
+        # best_rotation maps World to Aligned space. We want the object's local axes
+        # to match this aligned space exactly, so we use Aligned to World (the transpose/inverse)
+        aligned_to_world = best_rotation.T
+        rotation_matrix = mathutils.Matrix(aligned_to_world.tolist()).to_3x3()
 
+        old_loc, old_rot, old_scale = obj.matrix_world.decompose()
         pivot_vec = mathutils.Vector(pivot)
-        mw = obj.matrix_world
-        mat_trans_inv = mathutils.Matrix.Translation(-pivot_vec)
-        mat_trans = mathutils.Matrix.Translation(pivot_vec)
 
-        obj.matrix_world = mat_trans @ rot_mat_4x4 @ mat_trans_inv @ mw
+        # Build new matrix mapping Aligned to World, preserving scale and setting location to pivot
+        new_mw = mathutils.Matrix.LocRotScale(pivot_vec, rotation_matrix.to_quaternion(), old_scale)
+        self._apply_transform_and_keep_geometry(obj, new_mw)
 
     def _align_longest_axis(self, points, rotation, target_axis_str):
         """Rotate so longest bbox dimension aligns with target world axis."""
@@ -355,15 +391,17 @@ class OBJECT_OT_optimal_rotation(bpy.types.Operator):
                 points, refined_angle, plane_indices, self.align_longest_to
             )
 
-        rotation_axis = 'X' if axis_idx == 0 else ('Y' if axis_idx == 1 else 'Z')
-        rot_mat = mathutils.Matrix.Rotation(refined_angle, 4, rotation_axis)
-
+        rotation_axis = 'X' if axis_idx == 0 else ('Y' if axis_idx == 1 else 'Z') # Note: use locked_axis variable here if in the 2D function
+        
+        # refined_angle maps World to Aligned. We want Aligned to World, so we invert the angle
+        rot_mat = mathutils.Matrix.Rotation(-refined_angle, 3, rotation_axis)
+        
+        old_loc, old_rot, old_scale = obj.matrix_world.decompose()
         pivot_vec = mathutils.Vector(pivot)
-        mw = obj.matrix_world
-        mat_trans_inv = mathutils.Matrix.Translation(-pivot_vec)
-        mat_trans = mathutils.Matrix.Translation(pivot_vec)
 
-        obj.matrix_world = mat_trans @ rot_mat @ mat_trans_inv @ mw
+        # Build absolute matrix world
+        new_mw = mathutils.Matrix.LocRotScale(pivot_vec, rot_mat.to_quaternion(), old_scale)
+        self._apply_transform_and_keep_geometry(obj, new_mw)
 
     def _compute_2d_bbox_area(self, points_2d, angle):
         """Compute 2D bbox area after rotation by angle."""
@@ -376,11 +414,7 @@ class OBJECT_OT_optimal_rotation(bpy.types.Operator):
         return dims[0] * dims[1]
 
     def _align_longest_axis_1d(self, points, angle, plane_indices, target_axis_str):
-        """Align longest axis when rotating around a single axis.
-
-        Can only swap between the two axes in the rotation plane.
-        If longest is along the rotation axis, it cannot be moved.
-        """
+        """Align longest axis when rotating around a single axis."""
         idx_u, idx_v = plane_indices
 
         # Build 3D rotation matrix for current angle (rotation in the plane)
@@ -462,11 +496,13 @@ class OBJECT_OT_optimal_rotation(bpy.types.Operator):
         rot_mat = mathutils.Matrix.Rotation(refined_angle, 4, rotation_axis)
 
         pivot_vec = mathutils.Vector(pivot)
-        mw = obj.matrix_world
+        mw = obj.matrix_world.copy()
         mat_trans_inv = mathutils.Matrix.Translation(-pivot_vec)
         mat_trans = mathutils.Matrix.Translation(pivot_vec)
 
-        obj.matrix_world = mat_trans @ rot_mat @ mat_trans_inv @ mw
+        # Calculate new world matrix and apply it via our geometry anchor function
+        new_mw = mat_trans @ rot_mat @ mat_trans_inv @ mw
+        self._apply_transform_and_keep_geometry(obj, new_mw)
 
 
 class OBJECT_OT_preview_bbox(bpy.types.Operator):
