@@ -15,6 +15,8 @@ A Blender addon that automatically rotates objects to minimize their axis-aligne
 - **Bounding box preview** - visualize the current bounding box in the viewport
 - **Volume reduction reporting** - see how much the bounding box was reduced
 
+This fork keeps the positioning of the objects. I use this for fixing assets with applied transforms that were imported into Blender and therefore had a 0,0,0 XYZ position and rotations yet are rotated and offset.
+
 ## Installation
 
 ### Blender 4.2+ / 5.0 (Extension Format)
