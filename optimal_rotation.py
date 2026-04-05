@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Optimal Rotation (Smallest Bounding Box)",
     "author": "Noah Eisenbruch",
-    "version": (1, 1),
+    "version": (1, 5),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Item Tab",
-    "description": "Rotates objects to minimize world-space bounding box using convex hull and iterative refinement",
+    "description": "Aligns mesh vertex data to minimise the local bounding box (full 3D PCA)",
     "category": "Object",
 }
 
@@ -13,779 +13,474 @@ import bmesh
 import mathutils
 import math
 import numpy as np
-from bpy_extras import view3d_utils
-import gpu
-from gpu_extras.batch import batch_for_shader
 
-# Global for bbox visualization
-_bbox_draw_handler = None
-_bbox_data = None
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  Shared helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _convex_hull_pts(points):
+    """
+    Convex hull of points (N x 3 ndarray).
+    Returns (M x 3) hull vertices, or points on failure.
+    """
+    bm = bmesh.new()
+    try:
+        for p in points:
+            bm.verts.new(p)
+        bm.verts.ensure_lookup_table()
+        result = bmesh.ops.convex_hull(bm, input=bm.verts)
+        hull = np.array([v.co[:] for v in result['geom']
+                         if isinstance(v, bmesh.types.BMVert)])
+        return hull if len(hull) >= 4 else points
+    except Exception:
+        return points
+    finally:
+        bm.free()
+
+
+def _bbox_volume(pts):
+    d = pts.max(axis=0) - pts.min(axis=0)
+    return float(d[0] * d[1] * d[2])
+
+
+def _aa_mat(axis, angle):
+    """Rodrigues axis-angle to 3x3 rotation matrix."""
+    axis = axis / np.linalg.norm(axis)
+    K = np.array([[     0,  -axis[2],  axis[1]],
+                  [ axis[2],      0,  -axis[0]],
+                  [-axis[1],  axis[0],      0]])
+    return np.eye(3) + math.sin(angle) * K + (1 - math.cos(angle)) * (K @ K)
+
+
+def _find_best_rotation_3d(hull_pts):
+    """
+    Find the 3x3 rotation matrix R that minimises the AABB volume of
+    (hull_pts @ R.T).  R rows are the new local basis vectors.
+
+    Why full 3D and not Z-only:
+        Z-only rotation in local space only removes tilt in the local XY plane.
+        When an object has non-zero X or Y world rotation its stored vertex
+        coordinates can be misaligned along all three axes, making the local
+        AABB much larger than necessary. Full 3D PCA finds the unique rotation
+        that aligns the geometry's principal axes with the coordinate axes,
+        giving the tightest possible axis-aligned box in local space.
+        The result is ALWAYS flat relative to the object (the six faces of the
+        local AABB are always parallel to local X/Y/Z) -- this property comes
+        from working on the datablock directly, not from restricting axes.
+
+    Algorithm:
+        1. Full 3D PCA                         -- analytically optimal seed.
+        2. Coarse axis-angle refinement  +-45 deg / 9 steps per axis.
+        3. Fine   axis-angle refinement  +-10 deg / 21 steps per axis.
+        4. Deterministic sign convention       -- matches replacer pipeline.
+    """
+    mean     = hull_pts.mean(axis=0)
+    centered = hull_pts - mean
+    cov      = np.cov(centered.T)
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+
+    # Ascending eigenvalue sort:
+    #   smallest -> col 0 -> row 0 after .T -> local X (thinnest dimension)
+    #   largest  -> col 2 -> row 2 after .T -> local Z (longest dimension)
+    # This matches the axis convention expected by the replacer pipeline.
+    idx         = eigenvalues.argsort()
+    eigenvectors = eigenvectors[:, idx]
+    if np.linalg.det(eigenvectors) < 0:
+        eigenvectors[:, 0] *= -1
+
+    best_rot = eigenvectors.T       # rows are new basis vectors
+    best_vol = _bbox_volume(hull_pts @ best_rot.T)
+
+    # Pass 1 -- coarse: +-45 deg around each local axis
+    for ax in range(3):
+        axis_vec = np.zeros(3); axis_vec[ax] = 1.0
+        for angle in np.linspace(-math.pi / 4, math.pi / 4, 9):
+            if angle == 0:
+                continue
+            test = _aa_mat(axis_vec, angle) @ best_rot
+            vol  = _bbox_volume(hull_pts @ test.T)
+            if vol < best_vol:
+                best_vol, best_rot = vol, test
+
+    # Pass 2 -- fine: +-10 deg around each local axis
+    for ax in range(3):
+        axis_vec = np.zeros(3); axis_vec[ax] = 1.0
+        for angle in np.linspace(-math.pi / 18, math.pi / 18, 21):
+            if angle == 0:
+                continue
+            test = _aa_mat(axis_vec, angle) @ best_rot
+            vol  = _bbox_volume(hull_pts @ test.T)
+            if vol < best_vol:
+                best_vol, best_rot = vol, test
+
+    # Deterministic sign convention so the replacer's identity axis mapping holds:
+    #   Row 0 (smallest eigenvalue / thinnest): largest-magnitude component positive.
+    #   Row 2 (largest  eigenvalue / longest):  largest-magnitude component positive.
+    #   Row 1 (medium): cross(row2, row0) -- guarantees right-handedness.
+    for row_i in (0, 2):
+        primary = int(np.argmax(np.abs(best_rot[row_i])))
+        if best_rot[row_i, primary] < 0:
+            best_rot[row_i] *= -1
+    row1  = np.cross(best_rot[2], best_rot[0])
+    norm1 = np.linalg.norm(row1)
+    if norm1 > 1e-8:
+        best_rot[1] = row1 / norm1
+    elif np.linalg.det(best_rot) < 0:
+        best_rot[1] *= -1
+
+    return best_rot
+
+
+def _snap_longest_xy(hull_pts, rot, target_str):
+    """
+    After optimal rotation, optionally snap the longest XY dimension to
+    target_str ('X' or 'Y') by adding a 90 deg Z rotation.
+    The Z (longest overall) axis is left untouched.
+    """
+    dims       = (hull_pts @ rot.T).ptp(axis=0)   # [dx, dy, dz]
+    longest_xy = 0 if dims[0] >= dims[1] else 1
+    target_idx = 0 if target_str == 'X' else 1
+    if longest_xy == target_idx:
+        return rot
+    z90 = _aa_mat(np.array([0., 0., 1.]), math.pi / 2)
+    return z90 @ rot
+
+
+def _process_datablock(mesh, basis_snap, align_longest_to='NONE'):
+    """
+    Core routine shared by both operators.
+
+    Rotates mesh vertex data so the geometry's principal axes align with local
+    X/Y/Z, giving the tightest possible local AABB.  All objects referencing
+    this datablock are compensated via matrix_basis so world-space position and
+    orientation are completely unchanged.
+
+    Works entirely in local (datablock) space -- the object's world transform
+    is never read or written.  Correct regardless of view layer membership,
+    parent hierarchy, or how the object is oriented in the world.
+
+    Returns the % AABB volume reduction, or None on failure / skip.
+
+    Proof of neutrality for every referencing object O:
+        world_pos  = parent @ matrix_basis_old @ old_local_co
+        new_co     = R @ old_local_co
+        new_basis  = matrix_basis_old @ R^-1        (R^-1 = R.T, R is orthonormal)
+        world_pos' = parent @ new_basis @ new_co
+                   = parent @ (matrix_basis_old @ R.T) @ (R @ old_local_co)
+                   = parent @ matrix_basis_old @ old_local_co  =  world_pos  checkmark
+    """
+    v = len(mesh.vertices)
+    if v < 4:
+        return None
+
+    raw = np.empty(v * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", raw)
+    points = raw.reshape((-1, 3))
+
+    initial_vol = _bbox_volume(points)
+    if initial_vol <= 0:
+        return None
+
+    hull_pts = _convex_hull_pts(points)
+    if len(hull_pts) < 4:
+        return None
+
+    rot = _find_best_rotation_3d(hull_pts)
+
+    if align_longest_to != 'NONE':
+        rot = _snap_longest_xy(hull_pts, rot, align_longest_to)
+
+    new_coords = (points @ rot.T).astype(np.float32)
+
+    final_vol = _bbox_volume(new_coords)
+
+    # Skip if this rotation produces no meaningful improvement
+    # (geometry was already well-aligned, numerical noise only)
+    if initial_vol > 0 and (initial_vol - final_vol) / initial_vol < 1e-4:
+        return 0.0
+
+    # Compensate matrix_basis for every object using this datablock.
+    # matrix_basis is the raw stored transform -- always valid, no depsgraph needed.
+    rot_inv_4x4 = mathutils.Matrix(rot.tolist()).to_3x3().transposed().to_4x4()
+    for obj in bpy.data.objects:
+        if obj.data is not mesh:
+            continue
+        snap = basis_snap.get(obj.name, obj.matrix_basis.copy())
+        obj.matrix_basis = snap @ rot_inv_4x4
+
+    mesh.vertices.foreach_set("co", new_coords.ravel())
+    mesh.update()
+
+    return (1.0 - final_vol / initial_vol) * 100.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Per-Object Operator
+#  Processes only the datablocks of the selected objects.
+# ══════════════════════════════════════════════════════════════════════════════
 
 class OBJECT_OT_optimal_rotation(bpy.types.Operator):
-    """Calculate and apply optimal rotation for smallest bounding box"""
-    bl_idname = "object.optimal_rotation"
-    bl_label = "Optimal Rotation"
+    """Minimise the local bounding box of selected objects.
+Rotates vertex data so geometry principal axes align with local X/Y/Z.
+Objects stay in place; only their mesh data changes (full 3D alignment)."""
+    bl_idname  = "object.optimal_rotation"
+    bl_label   = "Optimal Rotation"
     bl_options = {'REGISTER', 'UNDO'}
 
-    axis_x: bpy.props.BoolProperty(
-        name="Rotate X",
-        default=True,
-        description="Allow rotation around the X axis"
-    )
-    axis_y: bpy.props.BoolProperty(
-        name="Rotate Y",
-        default=True,
-        description="Allow rotation around the Y axis"
-    )
-    axis_z: bpy.props.BoolProperty(
-        name="Rotate Z",
-        default=True,
-        description="Allow rotation around the Z axis"
-    )
-
-    use_origin_pivot: bpy.props.BoolProperty(
-        name="Use Object Origin",
-        default=False,
-        description="Rotate around object origin instead of geometry center"
-    )
-
     align_longest_to: bpy.props.EnumProperty(
         name="Align Longest To",
         items=[
-            ('NONE', "None", "Don't constrain longest axis alignment"),
-            ('X', "X Axis", "Align longest dimension to World X"),
-            ('Y', "Y Axis", "Align longest dimension to World Y"),
-            ('Z', "Z Axis", "Align longest dimension to World Z"),
+            ('NONE', "None",   "Don't constrain longest-axis alignment"),
+            ('X',    "X Axis", "Snap longest XY dimension to local X"),
+            ('Y',    "Y Axis", "Snap longest XY dimension to local Y"),
         ],
         default='NONE',
-        description="Align the longest dimension of the bounding box to a specific world axis"
     )
 
     @classmethod
     def poll(cls, context):
-        valid_types = {'MESH', 'CURVE', 'SURFACE', 'FONT', 'META'}
-        if context.active_object and context.active_object.type in valid_types:
-            return True
-        # Also allow if any selected object is valid
-        for obj in context.selected_objects:
-            if obj.type in valid_types:
-                return True
-        return False
+        return any(o.type == 'MESH' for o in context.selected_objects)
 
     def execute(self, context):
-        active_axes = [self.axis_x, self.axis_y, self.axis_z]
-        if not any(active_axes):
-            self.report({'WARNING'}, "No axes selected")
+        # Collect unique datablocks from selected mesh objects.
+        selected_meshes = {obj.data for obj in context.selected_objects
+                           if obj.type == 'MESH' and obj.data is not None}
+        if not selected_meshes:
+            self.report({'ERROR'}, "No mesh objects selected")
             return {'CANCELLED'}
 
-        valid_types = {'MESH', 'CURVE', 'SURFACE', 'FONT', 'META'}
-        objects_to_process = [obj for obj in context.selected_objects if obj.type in valid_types]
-
-        if not objects_to_process:
-            self.report({'ERROR'}, "No valid objects selected")
-            return {'CANCELLED'}
-
-        total_reduction = 0
-        processed = 0
-        depsgraph = context.evaluated_depsgraph_get()
-
-        for obj in objects_to_process:
-            result = self.process_object(obj, depsgraph, active_axes)
-            if result is not None:
-                total_reduction += result
-                processed += 1
-
-        if processed > 0:
-            avg_reduction = total_reduction / processed
-            if processed == 1:
-                self.report({'INFO'}, f"Bounding box volume reduced by {avg_reduction:.1f}%")
-            else:
-                self.report({'INFO'}, f"Processed {processed} objects, avg volume reduction: {avg_reduction:.1f}%")
-        else:
-            self.report({'WARNING'}, "No objects could be processed")
-
-        return {'FINISHED'}
-
-    def process_object(self, obj, depsgraph, active_axes):
-        """Process a single object. Returns reduction percentage or None on failure."""
-        obj_eval = obj.evaluated_get(depsgraph)
-
-        try:
-            mesh_eval = bpy.data.meshes.new_from_object(obj_eval)
-        except Exception:
-            return None
-
-        try:
-            v_count = len(mesh_eval.vertices)
-            if v_count < 4:
-                return None
-
-            # Fast vectorized vertex extraction
-            coords = np.empty(v_count * 3, dtype=np.float64)
-            mesh_eval.vertices.foreach_get("co", coords)
-            coords = coords.reshape((-1, 3))
-
-            # Vectorized world transform
-            mat = np.array(obj.matrix_world, dtype=np.float64)
-            ones = np.ones((v_count, 1), dtype=np.float64)
-            coords_4d = np.hstack([coords, ones])
-            points = (coords_4d @ mat.T)[:, :3]
-
-            # Convex hull
-            bm = bmesh.new()
-            for p in points:
-                bm.verts.new(p)
-            bm.verts.ensure_lookup_table()
-
-            try:
-                hull_result = bmesh.ops.convex_hull(bm, input=bm.verts)
-                hull_verts = hull_result['geom']
-                hull_points_list = [v.co[:] for v in hull_verts if isinstance(v, bmesh.types.BMVert)]
-                if not hull_points_list:
-                    hull_points = points
-                else:
-                    hull_points = np.array(hull_points_list)
-            except Exception:
-                hull_points = points
-            finally:
-                bm.free()
-
-        finally:
-            bpy.data.meshes.remove(mesh_eval)
-
-        if len(hull_points) < 4:
-            return None
-
-        # Determine pivot point
-        if self.use_origin_pivot:
-            pivot = np.array(obj.matrix_world.translation)
-        else:
-            pivot = np.mean(hull_points, axis=0)
-
-        # Calculate initial bounding box volume
-        initial_bbox = self.compute_bbox_volume(hull_points)
-
-        # Route to appropriate alignment method
-        if all(active_axes):
-            self.apply_optimal_rotation_3d(obj, hull_points, pivot)
-        elif sum(active_axes) == 1:
-            axis_idx = active_axes.index(True)
-            self.apply_optimal_rotation_1d(obj, hull_points, axis_idx, pivot)
-        else:
-            locked_axis = active_axes.index(False)
-            self.apply_optimal_rotation_2d(obj, hull_points, locked_axis, pivot)
-
-        # Calculate final volume
-        mat_new = np.array(obj.matrix_world, dtype=np.float64)
-        mat_inv = np.linalg.inv(mat)
-        local_hull = (np.hstack([hull_points, np.ones((len(hull_points), 1))]) @ mat_inv.T)[:, :3]
-        new_world = (np.hstack([local_hull, np.ones((len(local_hull), 1))]) @ mat_new.T)[:, :3]
-        final_bbox = self.compute_bbox_volume(new_world)
-
-        reduction = (1 - final_bbox / initial_bbox) * 100 if initial_bbox > 0 else 0
-        return reduction
-        
-    def _apply_transform_and_keep_geometry(self, obj, new_mw):
-        """Applies the new world matrix while counter-transforming the mesh data to stay in place."""
-        old_mw = obj.matrix_world.copy()
-        
-        # Calculate matrix difference to perfectly counteract the object rotation
-        delta_mat = new_mw.inverted() @ old_mw
-
-        # Update the object's transform
-        obj.matrix_world = new_mw
-
-        # Counter-transform the underlying geometry data so it visually remains static in world space
-        if hasattr(obj.data, "transform"):
-            obj.data.transform(delta_mat)
-            if obj.type == 'MESH':
-                obj.data.update()
-                
-        # Force Blender to recalculate and redraw the object's bounding box
-        obj.update_tag()
-        bpy.context.view_layer.update()
-        """Applies the new world matrix while counter-transforming the mesh data to stay in place."""
-        old_mw = obj.matrix_world.copy()
-        
-        # Calculate matrix difference to perfectly counteract the object rotation
-        delta_mat = new_mw.inverted() @ old_mw
-
-        # Update the object's transform
-        obj.matrix_world = new_mw
-
-        # Counter-transform the underlying geometry data so it visually remains static in world space
-        if hasattr(obj.data, "transform"):
-            obj.data.transform(delta_mat)
-            if obj.type == 'MESH':
-                obj.data.update()
-
-    def compute_bbox_volume(self, points):
-        """Compute axis-aligned bounding box volume."""
-        min_pt = np.min(points, axis=0)
-        max_pt = np.max(points, axis=0)
-        dims = max_pt - min_pt
-        return dims[0] * dims[1] * dims[2]
-
-    def apply_optimal_rotation_3d(self, obj, points, pivot):
-        """Apply PCA-based rotation with two-pass iterative refinement."""
-        mean = np.mean(points, axis=0)
-        centered_points = points - mean
-
-        # PCA via Covariance
-        cov = np.cov(centered_points.T)
-        eigenvalues, eigenvectors = np.linalg.eigh(cov)
-
-        idx = eigenvalues.argsort()[::-1]
-        eigenvectors = eigenvectors[:, idx]
-        sorted_eigenvalues = eigenvalues[idx]
-
-        if np.linalg.det(eigenvectors) < 0:
-            eigenvectors[:, 2] *= -1
-
-        best_rotation = eigenvectors.T
-        best_volume = self._compute_rotated_bbox_volume(points, best_rotation)
-
-        # Two-pass refinement for better accuracy
-        # Pass 1: Coarse search (-45° to +45°, 9 steps = 11.25° increments)
-        for ax in range(3):
-            for angle in np.linspace(-np.pi/4, np.pi/4, 9):
-                if angle == 0:
-                    continue
-                axis_vec = np.zeros(3)
-                axis_vec[ax] = 1.0
-                test_rot = self._axis_angle_to_matrix(axis_vec, angle)
-                combined = test_rot @ best_rotation
-
-                vol = self._compute_rotated_bbox_volume(points, combined)
-                if vol < best_volume:
-                    best_volume = vol
-                    best_rotation = combined
-
-        # Pass 2: Fine search around current best (-10° to +10°, 21 steps = 1° increments)
-        for ax in range(3):
-            for angle in np.linspace(-np.pi/18, np.pi/18, 21):
-                if angle == 0:
-                    continue
-                axis_vec = np.zeros(3)
-                axis_vec[ax] = 1.0
-                test_rot = self._axis_angle_to_matrix(axis_vec, angle)
-                combined = test_rot @ best_rotation
-
-                vol = self._compute_rotated_bbox_volume(points, combined)
-                if vol < best_volume:
-                    best_volume = vol
-                    best_rotation = combined
-
-        # Apply longest axis alignment if requested
-        if self.align_longest_to != 'NONE':
-            best_rotation = self._align_longest_axis(points, best_rotation, self.align_longest_to)
-
-        # best_rotation maps World to Aligned space. We want the object's local axes
-        # to match this aligned space exactly, so we use Aligned to World (the transpose/inverse)
-        aligned_to_world = best_rotation.T
-        rotation_matrix = mathutils.Matrix(aligned_to_world.tolist()).to_3x3()
-
-        old_loc, old_rot, old_scale = obj.matrix_world.decompose()
-        pivot_vec = mathutils.Vector(pivot)
-
-        # Build new matrix mapping Aligned to World, preserving scale and setting location to pivot
-        new_mw = mathutils.Matrix.LocRotScale(pivot_vec, rotation_matrix.to_quaternion(), old_scale)
-        self._apply_transform_and_keep_geometry(obj, new_mw)
-
-    def _align_longest_axis(self, points, rotation, target_axis_str):
-        """Rotate so longest bbox dimension aligns with target world axis."""
-        rotated = points @ rotation.T
-        min_pt = np.min(rotated, axis=0)
-        max_pt = np.max(rotated, axis=0)
-        dims = max_pt - min_pt
-
-        # Find which rotated axis has the longest dimension
-        longest_idx = np.argmax(dims)
-        target_idx = {'X': 0, 'Y': 1, 'Z': 2}[target_axis_str]
-
-        if longest_idx == target_idx:
-            return rotation  # Already aligned
-
-        # Swap axes by applying 90° rotation
-        # We need to rotate so axis[longest_idx] maps to axis[target_idx]
-        swap_rotation = np.eye(3)
-
-        if (longest_idx, target_idx) in [(0, 1), (1, 0)]:
-            # Swap X and Y: rotate 90° around Z
-            swap_rotation = self._axis_angle_to_matrix(np.array([0, 0, 1]), np.pi/2)
-        elif (longest_idx, target_idx) in [(0, 2), (2, 0)]:
-            # Swap X and Z: rotate 90° around Y
-            swap_rotation = self._axis_angle_to_matrix(np.array([0, 1, 0]), np.pi/2)
-        elif (longest_idx, target_idx) in [(1, 2), (2, 1)]:
-            # Swap Y and Z: rotate 90° around X
-            swap_rotation = self._axis_angle_to_matrix(np.array([1, 0, 0]), np.pi/2)
-
-        return swap_rotation @ rotation
-
-    def _compute_rotated_bbox_volume(self, points, rotation_matrix):
-        """Compute bbox volume after applying rotation."""
-        rotated = points @ rotation_matrix.T
-        min_pt = np.min(rotated, axis=0)
-        max_pt = np.max(rotated, axis=0)
-        dims = max_pt - min_pt
-        return dims[0] * dims[1] * dims[2]
-
-    def _axis_angle_to_matrix(self, axis, angle):
-        """Convert axis-angle to 3x3 rotation matrix (Rodrigues)."""
-        axis = axis / np.linalg.norm(axis)
-        K = np.array([
-            [0, -axis[2], axis[1]],
-            [axis[2], 0, -axis[0]],
-            [-axis[1], axis[0], 0]
-        ])
-        return np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
-
-    def apply_optimal_rotation_1d(self, obj, points, axis_idx, pivot):
-        """Optimize rotation around a single axis with two-pass refinement."""
-        plane_indices = [i for i in range(3) if i != axis_idx]
-        idx_u, idx_v = plane_indices
-
-        points_2d = points[:, [idx_u, idx_v]]
-
-        # 2D PCA
-        mean_2d = np.mean(points_2d, axis=0)
-        centered = points_2d - mean_2d
-        cov = np.cov(centered.T)
-        eigvals, eigvecs = np.linalg.eigh(cov)
-
-        idx = eigvals.argsort()[::-1]
-        eigvecs = eigvecs[:, idx]
-        major_axis = eigvecs[:, 0]
-
-        pca_angle = -math.atan2(major_axis[1], major_axis[0])
-
-        # Two-pass refinement
-        # Pass 1: Coarse
-        best_angle = pca_angle
-        best_area = self._compute_2d_bbox_area(points_2d, pca_angle)
-
-        for offset in np.linspace(-np.pi/4, np.pi/4, 17):
-            if offset == 0:
-                continue
-            test_angle = pca_angle + offset
-            area = self._compute_2d_bbox_area(points_2d, test_angle)
-            if area < best_area:
-                best_area = area
-                best_angle = test_angle
-
-        # Pass 2: Fine around best
-        refined_angle = best_angle
-        for offset in np.linspace(-np.pi/36, np.pi/36, 21):  # -5° to +5°, 0.5° steps
-            if offset == 0:
-                continue
-            test_angle = best_angle + offset
-            area = self._compute_2d_bbox_area(points_2d, test_angle)
-            if area < best_area:
-                best_area = area
-                refined_angle = test_angle
-
-        # Apply longest axis alignment if requested
-        if self.align_longest_to != 'NONE':
-            refined_angle = self._align_longest_axis_1d(
-                points, refined_angle, plane_indices, self.align_longest_to
-            )
-
-        rotation_axis = 'X' if axis_idx == 0 else ('Y' if axis_idx == 1 else 'Z') # Note: use locked_axis variable here if in the 2D function
-        
-        # refined_angle maps World to Aligned. We want Aligned to World, so we invert the angle
-        rot_mat = mathutils.Matrix.Rotation(-refined_angle, 3, rotation_axis)
-        
-        old_loc, old_rot, old_scale = obj.matrix_world.decompose()
-        pivot_vec = mathutils.Vector(pivot)
-
-        # Build absolute matrix world
-        new_mw = mathutils.Matrix.LocRotScale(pivot_vec, rot_mat.to_quaternion(), old_scale)
-        self._apply_transform_and_keep_geometry(obj, new_mw)
-
-    def _compute_2d_bbox_area(self, points_2d, angle):
-        """Compute 2D bbox area after rotation by angle."""
-        c, s = np.cos(angle), np.sin(angle)
-        rot = np.array([[c, -s], [s, c]])
-        rotated = points_2d @ rot.T
-        min_pt = np.min(rotated, axis=0)
-        max_pt = np.max(rotated, axis=0)
-        dims = max_pt - min_pt
-        return dims[0] * dims[1]
-
-    def _align_longest_axis_1d(self, points, angle, plane_indices, target_axis_str):
-        """Align longest axis when rotating around a single axis."""
-        idx_u, idx_v = plane_indices
-
-        # Build 3D rotation matrix for current angle (rotation in the plane)
-        c, s = np.cos(angle), np.sin(angle)
-        rot_3d = np.eye(3)
-        rot_3d[idx_u, idx_u] = c
-        rot_3d[idx_u, idx_v] = -s
-        rot_3d[idx_v, idx_u] = s
-        rot_3d[idx_v, idx_v] = c
-
-        # Compute 3D bbox dimensions after rotation
-        rotated = points @ rot_3d.T
-        min_pt = np.min(rotated, axis=0)
-        max_pt = np.max(rotated, axis=0)
-        dims = max_pt - min_pt
-
-        longest_idx = np.argmax(dims)
-        target_idx = {'X': 0, 'Y': 1, 'Z': 2}[target_axis_str]
-
-        if longest_idx == target_idx:
-            return angle  # Already aligned
-
-        # Can only swap between axes in the rotation plane
-        if longest_idx in plane_indices and target_idx in plane_indices:
-            # Add 90° to swap the two plane axes
-            return angle + np.pi / 2
-
-        # Cannot satisfy: longest is on rotation axis or target is rotation axis
-        return angle
-
-    def apply_optimal_rotation_2d(self, obj, points, locked_axis, pivot):
-        """Optimize rotation in 2 axes with two-pass refinement."""
-        active_indices = [i for i in range(3) if i != locked_axis]
-        idx_u, idx_v = active_indices
-
-        points_2d = points[:, [idx_u, idx_v]]
-
-        mean_2d = np.mean(points_2d, axis=0)
-        centered = points_2d - mean_2d
-        cov = np.cov(centered.T)
-        eigvals, eigvecs = np.linalg.eigh(cov)
-
-        idx = eigvals.argsort()[::-1]
-        eigvecs = eigvecs[:, idx]
-        major_axis = eigvecs[:, 0]
-
-        pca_angle = -math.atan2(major_axis[1], major_axis[0])
-
-        # Two-pass refinement
-        best_angle = pca_angle
-        best_area = self._compute_2d_bbox_area(points_2d, pca_angle)
-
-        for offset in np.linspace(-np.pi/4, np.pi/4, 17):
-            if offset == 0:
-                continue
-            test_angle = pca_angle + offset
-            area = self._compute_2d_bbox_area(points_2d, test_angle)
-            if area < best_area:
-                best_area = area
-                best_angle = test_angle
-
-        refined_angle = best_angle
-        for offset in np.linspace(-np.pi/36, np.pi/36, 21):
-            if offset == 0:
-                continue
-            test_angle = best_angle + offset
-            area = self._compute_2d_bbox_area(points_2d, test_angle)
-            if area < best_area:
-                best_area = area
-                refined_angle = test_angle
-
-        # Apply longest axis alignment if requested
-        if self.align_longest_to != 'NONE':
-            refined_angle = self._align_longest_axis_1d(
-                points, refined_angle, active_indices, self.align_longest_to
-            )
-
-        rotation_axis = 'X' if locked_axis == 0 else ('Y' if locked_axis == 1 else 'Z')
-        rot_mat = mathutils.Matrix.Rotation(refined_angle, 4, rotation_axis)
-
-        pivot_vec = mathutils.Vector(pivot)
-        mw = obj.matrix_world.copy()
-        mat_trans_inv = mathutils.Matrix.Translation(-pivot_vec)
-        mat_trans = mathutils.Matrix.Translation(pivot_vec)
-
-        # Calculate new world matrix and apply it via our geometry anchor function
-        new_mw = mat_trans @ rot_mat @ mat_trans_inv @ mw
-        self._apply_transform_and_keep_geometry(obj, new_mw)
-
-
-class OBJECT_OT_preview_bbox(bpy.types.Operator):
-    """Preview the bounding box without applying rotation"""
-    bl_idname = "object.preview_optimal_bbox"
-    bl_label = "Preview Bounding Box"
-    bl_options = {'REGISTER'}
-
-    @classmethod
-    def poll(cls, context):
-        valid_types = {'MESH', 'CURVE', 'SURFACE', 'FONT', 'META'}
-        return context.active_object and context.active_object.type in valid_types
-
-    def execute(self, context):
-        global _bbox_draw_handler, _bbox_data
-
-        obj = context.active_object
-        if not obj:
-            return {'CANCELLED'}
-
-        # Get bbox corners
-        bbox_corners = self.get_world_bbox_corners(obj, context)
-        if bbox_corners is None:
-            self.report({'ERROR'}, "Could not compute bounding box")
-            return {'CANCELLED'}
-
-        # Store bbox data for drawing
-        _bbox_data = {
-            'corners': bbox_corners,
-            'color': (0.0, 1.0, 0.5, 0.8),  # Green
+        # Snapshot matrix_basis for ALL objects sharing these datablocks
+        # (not just selected ones -- shared users must be compensated too).
+        basis_snap = {
+            obj.name: obj.matrix_basis.copy()
+            for obj in bpy.data.objects
+            if obj.type == 'MESH' and obj.data in selected_meshes
         }
 
-        # Add draw handler if not already added
-        if _bbox_draw_handler is None:
-            _bbox_draw_handler = bpy.types.SpaceView3D.draw_handler_add(
-                draw_bbox_callback, (), 'WINDOW', 'POST_VIEW'
-            )
+        total_red, processed = 0.0, 0
+        for mesh in selected_meshes:
+            r = _process_datablock(mesh, basis_snap, self.align_longest_to)
+            if r is not None:
+                total_red += r
+                processed += 1
 
-        # Force redraw
-        for area in context.screen.areas:
-            if area.type == 'VIEW_3D':
-                area.tag_redraw()
+        if processed == 0:
+            self.report({'WARNING'}, "No meshes could be processed")
+            return {'CANCELLED'}
 
-        # Compute and report dimensions
-        min_pt = np.min(bbox_corners, axis=0)
-        max_pt = np.max(bbox_corners, axis=0)
-        dims = max_pt - min_pt
-        volume = dims[0] * dims[1] * dims[2]
-
-        self.report({'INFO'}, f"BBox: {dims[0]:.3f} x {dims[1]:.3f} x {dims[2]:.3f}, Volume: {volume:.4f}")
-
-        return {'FINISHED'}
-
-    def get_world_bbox_corners(self, obj, context):
-        """Get world-space bounding box corners."""
-        depsgraph = context.evaluated_depsgraph_get()
-        obj_eval = obj.evaluated_get(depsgraph)
-
-        try:
-            mesh_eval = bpy.data.meshes.new_from_object(obj_eval)
-        except Exception:
-            return None
-
-        try:
-            v_count = len(mesh_eval.vertices)
-            if v_count < 1:
-                return None
-
-            coords = np.empty(v_count * 3, dtype=np.float64)
-            mesh_eval.vertices.foreach_get("co", coords)
-            coords = coords.reshape((-1, 3))
-
-            mat = np.array(obj.matrix_world, dtype=np.float64)
-            ones = np.ones((v_count, 1), dtype=np.float64)
-            coords_4d = np.hstack([coords, ones])
-            points = (coords_4d @ mat.T)[:, :3]
-
-            min_pt = np.min(points, axis=0)
-            max_pt = np.max(points, axis=0)
-
-            # Generate 8 corners of AABB
-            corners = np.array([
-                [min_pt[0], min_pt[1], min_pt[2]],
-                [max_pt[0], min_pt[1], min_pt[2]],
-                [max_pt[0], max_pt[1], min_pt[2]],
-                [min_pt[0], max_pt[1], min_pt[2]],
-                [min_pt[0], min_pt[1], max_pt[2]],
-                [max_pt[0], min_pt[1], max_pt[2]],
-                [max_pt[0], max_pt[1], max_pt[2]],
-                [min_pt[0], max_pt[1], max_pt[2]],
-            ])
-            return corners
-
-        finally:
-            bpy.data.meshes.remove(mesh_eval)
-
-
-class OBJECT_OT_clear_bbox_preview(bpy.types.Operator):
-    """Clear the bounding box preview"""
-    bl_idname = "object.clear_bbox_preview"
-    bl_label = "Clear Preview"
-    bl_options = {'REGISTER'}
-
-    def execute(self, context):
-        global _bbox_draw_handler, _bbox_data
-
-        if _bbox_draw_handler is not None:
-            bpy.types.SpaceView3D.draw_handler_remove(_bbox_draw_handler, 'WINDOW')
-            _bbox_draw_handler = None
-
-        _bbox_data = None
-
-        for area in context.screen.areas:
-            if area.type == 'VIEW_3D':
-                area.tag_redraw()
-
+        avg = total_red / processed
+        msg = (f"Bounding box volume reduced by {avg:.1f}%"
+               if processed == 1
+               else f"Processed {processed} meshes, avg reduction: {avg:.1f}%")
+        self.report({'INFO'}, msg)
         return {'FINISHED'}
 
 
-def draw_bbox_callback():
-    """Draw bounding box wireframe in viewport."""
-    global _bbox_data
+# ══════════════════════════════════════════════════════════════════════════════
+#  Batch Datablock Operator
+#  Same core logic, applied to every mesh datablock in the file.
+# ══════════════════════════════════════════════════════════════════════════════
 
-    if _bbox_data is None:
-        return
+class OBJECT_OT_optimal_rotation_datablocks(bpy.types.Operator):
+    """Apply optimal 3D rotation to every mesh datablock in the file.
+Identical algorithm to per-object, just applied to all meshes at once."""
+    bl_idname  = "object.optimal_rotation_datablocks"
+    bl_label   = "Process All Mesh Datablocks"
+    bl_options = {'REGISTER', 'UNDO'}
 
-    corners = _bbox_data['corners']
-    color = _bbox_data['color']
-
-    # Define edges (pairs of corner indices)
-    edges = [
-        (0, 1), (1, 2), (2, 3), (3, 0),  # Bottom face
-        (4, 5), (5, 6), (6, 7), (7, 4),  # Top face
-        (0, 4), (1, 5), (2, 6), (3, 7),  # Vertical edges
-    ]
-
-    vertices = []
-    for e in edges:
-        vertices.append(tuple(corners[e[0]]))
-        vertices.append(tuple(corners[e[1]]))
-
-    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
-    batch = batch_for_shader(shader, 'LINES', {"pos": vertices})
-
-    gpu.state.line_width_set(2.0)
-    gpu.state.blend_set('ALPHA')
-
-    shader.bind()
-    shader.uniform_float("color", color)
-    batch.draw(shader)
-
-    gpu.state.blend_set('NONE')
-    gpu.state.line_width_set(1.0)
-
-
-class OptimalRotationSettings(bpy.types.PropertyGroup):
-    axis_x: bpy.props.BoolProperty(
-        name="Limit X",
-        default=True,
-        description="Allow rotation around World X axis"
-    )
-    axis_y: bpy.props.BoolProperty(
-        name="Limit Y",
-        default=True,
-        description="Allow rotation around World Y axis"
-    )
-    axis_z: bpy.props.BoolProperty(
-        name="Limit Z",
-        default=True,
-        description="Allow rotation around World Z axis"
-    )
-    use_origin_pivot: bpy.props.BoolProperty(
-        name="Use Object Origin",
-        default=False,
-        description="Rotate around object origin instead of geometry center"
-    )
     align_longest_to: bpy.props.EnumProperty(
         name="Align Longest To",
         items=[
-            ('NONE', "None", "Don't constrain longest axis alignment"),
-            ('X', "X Axis", "Align longest dimension to World X"),
-            ('Y', "Y Axis", "Align longest dimension to World Y"),
-            ('Z', "Z Axis", "Align longest dimension to World Z"),
+            ('NONE', "None",   "Don't constrain longest-axis alignment"),
+            ('X',    "X Axis", "Snap longest XY dimension to local X"),
+            ('Y',    "Y Axis", "Snap longest XY dimension to local Y"),
         ],
         default='NONE',
-        description="Align the longest dimension of the bounding box to a specific world axis"
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return bool(bpy.data.meshes)
+
+    def execute(self, context):
+        # Single global snapshot before touching any vertex data.
+        basis_snap = {
+            obj.name: obj.matrix_basis.copy()
+            for obj in bpy.data.objects
+            if obj.type == 'MESH'
+        }
+
+        all_meshes         = list(bpy.data.meshes)
+        total              = len(all_meshes)
+        processed, skipped = 0, 0
+        total_red          = 0.0
+
+        print(f"\nOptimal Rotation -- processing {total} mesh datablocks ...")
+
+        for i, mesh in enumerate(all_meshes, 1):
+            tag = f"[{i}/{total}] {mesh.name!r:40s}"
+            r = _process_datablock(mesh, basis_snap, self.align_longest_to)
+            if r is None:
+                print(f"{tag} -- skipped")
+                skipped += 1
+            else:
+                print(f"{tag} -- reduced by {r:.1f}%")
+                total_red += r
+                processed += 1
+
+        avg = total_red / processed if processed else 0.0
+        msg = (f"Processed {processed} datablocks (skipped {skipped}). "
+               f"Avg bbox volume reduction: {avg:.1f}%")
+        print(f"\n{msg}\n")
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Viewport Bounds Toggle Operators
+# ══════════════════════════════════════════════════════════════════════════════
+
+class OBJECT_OT_toggle_bounds_active(bpy.types.Operator):
+    """Toggle Viewport Display > Bounds for the active object"""
+    bl_idname  = "object.toggle_bounds_active"
+    bl_label   = "Toggle Bounds (Active)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object is not None
+
+    def execute(self, context):
+        obj = context.active_object
+        obj.show_bounds         = not obj.show_bounds
+        obj.display_bounds_type = 'BOX'
+        self.report({'INFO'},
+                    f"Bounds {'on' if obj.show_bounds else 'off'} for '{obj.name}'")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_toggle_bounds_all(bpy.types.Operator):
+    """Toggle Viewport Display > Bounds on ALL objects.
+Turns all off if any are on; otherwise turns all on."""
+    bl_idname  = "object.toggle_bounds_all"
+    bl_label   = "Toggle Bounds (All)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(bpy.data.objects)
+
+    def execute(self, context):
+        objects = list(bpy.data.objects)
+        target  = not any(o.show_bounds for o in objects)
+        for obj in objects:
+            obj.show_bounds         = target
+            obj.display_bounds_type = 'BOX'
+        self.report({'INFO'},
+                    f"Bounds {'on' if target else 'off'} for {len(objects)} objects")
+        return {'FINISHED'}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Settings & Panel
+# ══════════════════════════════════════════════════════════════════════════════
+
+class OptimalRotationSettings(bpy.types.PropertyGroup):
+    align_longest_to: bpy.props.EnumProperty(
+        name="Align Longest To",
+        items=[
+            ('NONE', "None",   "Don't constrain longest-axis alignment"),
+            ('X',    "X Axis", "Snap longest XY dimension to local X"),
+            ('Y',    "Y Axis", "Snap longest XY dimension to local Y"),
+        ],
+        default='NONE',
     )
 
 
 class VIEW3D_PT_optimal_rotation(bpy.types.Panel):
-    """Panel for Optimal Rotation"""
-    bl_label = "Optimal Rotation"
-    bl_idname = "VIEW3D_PT_optimal_rotation"
-    bl_space_type = 'VIEW_3D'
+    bl_label       = "Optimal Rotation"
+    bl_idname      = "VIEW3D_PT_optimal_rotation"
+    bl_space_type  = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = 'Item'
+    bl_category    = 'Item'
 
     def draw(self, context):
-        layout = self.layout
+        layout   = self.layout
         settings = context.scene.optimal_rotation_settings
 
-        # Rotation Axes
         col = layout.column(align=True)
-        col.label(text="Rotation Axes:")
-        row = col.row(align=True)
-        row.prop(settings, "axis_x", toggle=True, text="X")
-        row.prop(settings, "axis_y", toggle=True, text="Y")
-        row.prop(settings, "axis_z", toggle=True, text="Z")
-
-        layout.separator()
-
-        # Pivot Point
-        col = layout.column(align=True)
-        col.label(text="Pivot Point:")
-        col.prop(settings, "use_origin_pivot", text="Object Origin" if settings.use_origin_pivot else "Geometry Center", toggle=True)
-
-        layout.separator()
-
-        # Align Longest Axis
-        col = layout.column(align=True)
-        col.label(text="Align Longest Axis:")
+        col.label(text="Align Longest XY To:")
         col.prop(settings, "align_longest_to", text="")
 
         layout.separator()
 
-        # Main operator button
-        op = layout.operator("object.optimal_rotation", text="Calculate Optimal Rotation")
-        op.axis_x = settings.axis_x
-        op.axis_y = settings.axis_y
-        op.axis_z = settings.axis_z
-        op.use_origin_pivot = settings.use_origin_pivot
+        # ---- Per-object (selected datablocks) --------------------------------
+        box = layout.box()
+        box.label(text="Selected Objects:", icon='OBJECT_DATA')
+        box.label(text="Full 3D PCA -- rotates vertex data.", icon='INFO')
+
+        op = box.operator("object.optimal_rotation", text="Align Selected")
         op.align_longest_to = settings.align_longest_to
 
-        # Selection info
-        valid_types = {'MESH', 'CURVE', 'SURFACE', 'FONT', 'META'}
-        valid_count = sum(1 for obj in context.selected_objects if obj.type in valid_types)
-        if valid_count > 1:
-            layout.label(text=f"{valid_count} objects selected", icon='INFO')
+        n = sum(1 for o in context.selected_objects if o.type == 'MESH')
+        if n > 0:
+            box.label(text=f"{n} mesh object(s) selected", icon='BLANK1')
 
         layout.separator()
 
-        # Preview section
-        box = layout.box()
-        box.label(text="Preview:", icon='HIDE_OFF')
-        row = box.row(align=True)
-        row.operator("object.preview_optimal_bbox", text="Show BBox", icon='CUBE')
-        row.operator("object.clear_bbox_preview", text="Clear", icon='X')
+        # ---- Batch (all datablocks) ------------------------------------------
+        box_db = layout.box()
+        box_db.label(text="All Mesh Datablocks:", icon='MESH_DATA')
+        box_db.label(text="Same algorithm, every mesh in file.", icon='INFO')
+
+        op_db = box_db.operator(
+            "object.optimal_rotation_datablocks",
+            text="Process All Datablocks",
+            icon='WORLD',
+        )
+        op_db.align_longest_to = settings.align_longest_to
+        box_db.label(text=f"{len(bpy.data.meshes)} mesh datablocks in file",
+                     icon='BLANK1')
+
+        layout.separator()
+
+        # ---- Viewport bounds -------------------------------------------------
+        box_b = layout.box()
+        box_b.label(text="Viewport Bounds:", icon='CUBE')
+        row = box_b.row(align=True)
+        row.operator("object.toggle_bounds_active",
+                     text="Active Object", icon='OBJECT_DATA')
+        row.operator("object.toggle_bounds_all",
+                     text="All Objects",   icon='WORLD')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Registration
+# ══════════════════════════════════════════════════════════════════════════════
+
+_CLASSES = (
+    OBJECT_OT_optimal_rotation,
+    OBJECT_OT_optimal_rotation_datablocks,
+    OBJECT_OT_toggle_bounds_active,
+    OBJECT_OT_toggle_bounds_all,
+    OptimalRotationSettings,
+    VIEW3D_PT_optimal_rotation,
+)
 
 
 def register():
-    bpy.utils.register_class(OBJECT_OT_optimal_rotation)
-    bpy.utils.register_class(OBJECT_OT_preview_bbox)
-    bpy.utils.register_class(OBJECT_OT_clear_bbox_preview)
-    bpy.utils.register_class(OptimalRotationSettings)
-    bpy.utils.register_class(VIEW3D_PT_optimal_rotation)
-    bpy.types.Scene.optimal_rotation_settings = bpy.props.PointerProperty(type=OptimalRotationSettings)
+    for cls in _CLASSES:
+        bpy.utils.register_class(cls)
+    bpy.types.Scene.optimal_rotation_settings = bpy.props.PointerProperty(
+        type=OptimalRotationSettings
+    )
 
 
 def unregister():
-    global _bbox_draw_handler, _bbox_data
-
-    # Clean up draw handler
-    if _bbox_draw_handler is not None:
-        try:
-            bpy.types.SpaceView3D.draw_handler_remove(_bbox_draw_handler, 'WINDOW')
-        except Exception:
-            pass
-        _bbox_draw_handler = None
-    _bbox_data = None
-
-    # Remove scene property
     if hasattr(bpy.types.Scene, 'optimal_rotation_settings'):
         del bpy.types.Scene.optimal_rotation_settings
-
-    # Unregister classes (continue even if one fails)
-    classes = [
-        VIEW3D_PT_optimal_rotation,
-        OptimalRotationSettings,
-        OBJECT_OT_clear_bbox_preview,
-        OBJECT_OT_preview_bbox,
-        OBJECT_OT_optimal_rotation,
-    ]
-    for cls in classes:
+    for cls in reversed(_CLASSES):
         try:
             bpy.utils.unregister_class(cls)
         except RuntimeError:
